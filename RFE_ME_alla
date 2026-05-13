@@ -1,0 +1,878 @@
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ranger); library(ggplot2)
+})
+
+output_dir <- "rna_seq_outputs"
+
+evaluate_rf <- function(df, feats, n_splits = 10, test_frac = 0.2,
+                        num_trees = 1000, seed = 42) {
+  d <- df[, c("delta_PASI", "PASI_baseline", feats), drop = FALSE]
+  d <- d[complete.cases(d), ]
+  if (nrow(d) < 10) return(NULL)
+  d$.row_id <- seq_len(nrow(d))
+  
+  importance_list <- list()
+  predictions_list <- list()
+  
+  sp <- bind_rows(lapply(seq_len(n_splits), function(s) {
+    set.seed(seed + s)
+    ti <- sample(nrow(d), max(1, floor(test_frac * nrow(d))))
+    train <- d[-ti, ]; test <- d[ti, ]
+    
+    lm_fit <- lm(delta_PASI ~ PASI_baseline, data = train)
+    train$residual_PASI <- as.numeric(residuals(lm_fit))
+    test$residual_PASI  <- test$delta_PASI - as.numeric(predict(lm_fit, newdata = test))
+    
+    m <- ranger(dependent.variable.name = "residual_PASI",
+                data = train[, c("residual_PASI", feats)],
+                num.trees = num_trees, importance = "permutation",
+                seed = seed + s)
+    p <- predict(m, data = test[, c("residual_PASI", feats)])$predictions
+    o <- test$residual_PASI
+    
+    rmse_rf   <- sqrt(mean((p - o)^2))
+    rmse_null <- sqrt(mean(o^2))
+    
+    importance_list[[s]] <<- m$variable.importance
+    predictions_list[[s]] <<- data.frame(
+      row_id = test$.row_id,
+      delta_PASI = test$delta_PASI,
+      PASI_baseline = test$PASI_baseline,
+      residual_obs = o, residual_pred = p)
+    
+    data.frame(split = s, rmse = rmse_rf, rmse_null = rmse_null,
+               skill = 1 - rmse_rf / rmse_null)
+  }))
+  
+  imp_mat <- do.call(cbind, importance_list)
+  imp_df <- data.frame(feature = rownames(imp_mat),
+                       importance = rowMeans(imp_mat, na.rm = TRUE))
+  imp_df <- imp_df[order(-imp_df$importance), ]
+  
+  preds_per_patient <- bind_rows(predictions_list) %>%
+    group_by(row_id) %>%
+    summarise(delta_PASI = first(delta_PASI),
+              PASI_baseline = first(PASI_baseline),
+              residual_obs = first(residual_obs),
+              pred_mean = mean(residual_pred),
+              .groups = "drop")
+  
+  list(features = feats, n_features = length(feats),
+       rmse_mean = mean(sp$rmse), rmse_sd = sd(sp$rmse),
+       rmse_null_mean = mean(sp$rmse_null), rmse_null_sd = sd(sp$rmse_null),
+       skill_mean = mean(sp$skill), skill_sd = sd(sp$skill),
+       importance = imp_df,
+       predictions_patient = preds_per_patient)
+}
+
+run_rfe <- function(df, feats, drop_n = 1, min_features = 2,
+                    n_splits = 10, test_frac = 0.2, num_trees = 1000, seed = 42,
+                    verbose = TRUE) {
+  path <- list(); cur <- feats
+  while (length(cur) >= min_features) {
+    res <- evaluate_rf(df, cur, n_splits, test_frac, num_trees, seed)
+    if (is.null(res)) break
+    if (verbose) cat(sprintf("    %2d feat | RMSE %.2f | Skill %+.2f\n",
+                             length(cur), res$rmse_mean, res$skill_mean))
+    path[[length(path) + 1]] <- res
+    cur <- setdiff(cur, tail(res$importance$feature, drop_n))
+  }
+  if (length(path) == 0) return(NULL)
+  best_idx <- which.min(sapply(path, `[[`, "rmse_mean"))
+  list(best = path[[best_idx]], path = path)
+}
+
+# ── NEW: Nested Monte Carlo CV ───────────────────────────────────────────────
+# Outer loop: held-out test set, never seen during RFE/feature selection.
+# Inner loop: existing run_rfe (uses inner CV on outer_train only).
+
+nested_rf_mc <- function(df, feats, n_outer = 20, outer_test_frac = 0.25,
+                         inner_n_splits = 10, inner_test_frac = 0.2,
+                         num_trees = 1000, seed = 42,
+                         rfe_drop_n = 1, rfe_min_features = 2,
+                         verbose = TRUE) {
+  
+  outer_results <- list()
+  
+  for (s in seq_len(n_outer)) {
+    set.seed(seed + s * 1000)
+    n <- nrow(df)
+    out_idx <- sample(n, max(2, floor(outer_test_frac * n)))
+    outer_train <- df[-out_idx, ]
+    outer_test  <- df[out_idx, ]
+    
+    if (verbose) cat(sprintf("  Outer split %d/%d (train=%d, test=%d)\n",
+                             s, n_outer, nrow(outer_train), nrow(outer_test)))
+    
+    # RFE on outer_train (uses inner CV with own per-split residualization)
+    rfe <- run_rfe(outer_train, feats,
+                   drop_n = rfe_drop_n, min_features = rfe_min_features,
+                   n_splits = inner_n_splits, test_frac = inner_test_frac,
+                   num_trees = num_trees, seed = seed + s * 1000,
+                   verbose = FALSE)
+    if (is.null(rfe)) next
+    
+    best_feats <- rfe$best$features
+    
+    lm_outer <- lm(delta_PASI ~ PASI_baseline, data = outer_train)
+    outer_train$residual_PASI <- as.numeric(residuals(lm_outer))
+    outer_test$residual_PASI  <- outer_test$delta_PASI -
+      as.numeric(predict(lm_outer, newdata = outer_test))
+    m_final <- ranger(
+      dependent.variable.name = "residual_PASI",
+      data = outer_train[, c("residual_PASI", best_feats)],
+      num.trees = num_trees, importance = "permutation",
+      seed = seed + s * 1000
+    )
+    p_test <- predict(m_final, data = outer_test[, c("residual_PASI", best_feats)])$predictions
+    o_test <- outer_test$residual_PASI
+    
+    rmse_rf   <- sqrt(mean((p_test - o_test)^2))
+    rmse_null <- sqrt(mean(o_test^2))
+    
+    # Strip heavy fields from inner path before storing
+    inner_path_lite <- lapply(rfe$path, function(r) {
+      list(n_features = r$n_features,
+           rmse_mean = r$rmse_mean, rmse_sd = r$rmse_sd,
+           rmse_null_mean = r$rmse_null_mean,
+           skill_mean = r$skill_mean, skill_sd = r$skill_sd)
+    })
+    
+    outer_results[[s]] <- list(
+      outer_split = s,
+      n_train = nrow(outer_train), n_test = nrow(outer_test),
+      best_features = best_feats,
+      n_best_features = length(best_feats),
+      importance_final = m_final$variable.importance,
+      rmse = rmse_rf, rmse_null = rmse_null,
+      skill = 1 - rmse_rf / rmse_null,
+      preds = data.frame(
+        delta_PASI = outer_test$delta_PASI,
+        PASI_baseline = outer_test$PASI_baseline,
+        residual_obs = o_test,
+        residual_pred = p_test,
+        delta_pred = p_test + as.numeric(predict(lm_outer, newdata = outer_test))
+      ),
+      inner_skill = rfe$best$skill_mean,    # optimistic (inner-CV) skill
+      inner_rmse = rfe$best$rmse_mean,
+      inner_path = inner_path_lite
+    )
+    
+    if (verbose) cat(sprintf("    → honest: RMSE %.2f vs null %.2f | Skill %+.2f | %d feats\n",
+                             rmse_rf, rmse_null, outer_results[[s]]$skill,
+                             length(best_feats)))
+  }
+  
+  outer_results <- Filter(Negate(is.null), outer_results)
+  if (length(outer_results) == 0) return(NULL)
+  
+  # Aggregate across outer splits
+  skills      <- sapply(outer_results, `[[`, "skill")
+  rmses       <- sapply(outer_results, `[[`, "rmse")
+  rmse_nulls  <- sapply(outer_results, `[[`, "rmse_null")
+  feat_counts <- sapply(outer_results, `[[`, "n_best_features")
+  inner_skills <- sapply(outer_results, `[[`, "inner_skill")
+  
+  # Feature selection frequency across outer splits
+  feat_freq <- table(unlist(lapply(outer_results, `[[`, "best_features")))
+  feat_freq <- sort(feat_freq, decreasing = TRUE) / length(outer_results)
+  
+  # Aggregate importance: mean across outer splits where feature was selected
+  all_feats_seen <- unique(unlist(lapply(outer_results,
+                                         function(o) names(o$importance_final))))
+  imp_mat <- matrix(NA_real_, nrow = length(all_feats_seen),
+                    ncol = length(outer_results),
+                    dimnames = list(all_feats_seen, NULL))
+  for (i in seq_along(outer_results)) {
+    imp_i <- outer_results[[i]]$importance_final
+    imp_mat[names(imp_i), i] <- imp_i
+  }
+  imp_df <- data.frame(
+    feature = rownames(imp_mat),
+    importance = rowMeans(imp_mat, na.rm = TRUE),
+    selection_frequency = rowMeans(!is.na(imp_mat))
+  )
+  imp_df <- imp_df[order(-imp_df$selection_frequency, -imp_df$importance), ]
+  
+  
+  rfe_path_df <- bind_rows(lapply(outer_results, function(o) {
+    bind_rows(lapply(o$inner_path, function(r) {
+      data.frame(outer_split = o$outer_split,
+                 n_features = r$n_features,
+                 skill = r$skill_mean,
+                 rmse = r$rmse_mean)
+    }))
+  }))
+  rfe_path_summary <- rfe_path_df %>%
+    group_by(n_features) %>%
+    summarise(skill_mean = mean(skill), skill_sd = sd(skill),
+              rmse_mean = mean(rmse), rmse_sd = sd(rmse),
+              n_paths = n(), .groups = "drop")
+  
+  # Per-patient predictions aggregated (a patient may appear in multiple outer test sets)
+  all_preds <- bind_rows(lapply(outer_results, function(o) o$preds))
+  
+  # Paired test on outer splits: outer null vs outer rf
+  paired_p <- tryCatch(
+    suppressWarnings(wilcox.test(rmse_nulls, rmses, paired = TRUE,
+                                 alternative = "greater")$p.value),
+    error = function(e) NA_real_)
+  
+  list(
+    n_outer_splits = length(outer_results),
+    honest_rmse_mean      = mean(rmses),       honest_rmse_sd      = sd(rmses),
+    honest_rmse_null_mean = mean(rmse_nulls),  honest_rmse_null_sd = sd(rmse_nulls),
+    honest_skill_mean     = mean(skills),      honest_skill_sd     = sd(skills),
+    optimistic_skill_mean = mean(inner_skills), optimistic_skill_sd = sd(inner_skills),
+    median_n_features = median(feat_counts),
+    feat_count_range  = range(feat_counts),
+    feature_frequency = feat_freq,
+    paired_p = paired_p,
+    importance_aggregated = imp_df,
+    rfe_path_summary = rfe_path_summary,
+    rfe_path_raw = rfe_path_df,
+    outer_results = outer_results,
+    predictions_all = all_preds
+  )
+}
+
+permutation_null <- function(df, feats, n_perm = 100,
+                             n_outer = 5, outer_test_frac = 0.25,
+                             fixed_n_features = NULL,
+                             num_trees = 500, seed = 1,
+                             verbose = TRUE) {
+  
+  if (is.null(fixed_n_features)) {
+    fixed_n_features <- min(length(feats), 10)
+  }
+  fixed_n_features <- min(fixed_n_features, length(feats))
+  
+  null_skills <- numeric(n_perm)
+  
+  for (p in seq_len(n_perm)) {
+    set.seed(seed + p * 7919)
+    df_perm <- df
+    df_perm$delta_PASI <- sample(df$delta_PASI)  # shuffle outcome
+    
+    perm_skills <- numeric(n_outer)
+    
+    for (s in seq_len(n_outer)) {
+      set.seed(seed + p * 7919 + s)
+      n <- nrow(df_perm)
+      out_idx <- sample(n, max(2, floor(outer_test_frac * n)))
+      otrain <- df_perm[-out_idx, ]
+      otest  <- df_perm[out_idx, ]
+      
+      lm_o <- lm(delta_PASI ~ PASI_baseline, data = otrain)
+      otrain$residual_PASI <- as.numeric(residuals(lm_o))
+      otest$residual_PASI  <- otest$delta_PASI -
+        as.numeric(predict(lm_o, newdata = otest))
+      
+      # Importance ranking on outer_train (single fit, no RFE)
+      m_imp <- ranger(dependent.variable.name = "residual_PASI",
+                      data = otrain[, c("residual_PASI", feats)],
+                      num.trees = num_trees, importance = "permutation",
+                      seed = seed + p * 7919 + s)
+      top_feats <- names(sort(m_imp$variable.importance,
+                              decreasing = TRUE))[seq_len(fixed_n_features)]
+      
+      # Refit with top features only
+      m_final <- ranger(dependent.variable.name = "residual_PASI",
+                        data = otrain[, c("residual_PASI", top_feats)],
+                        num.trees = num_trees,
+                        seed = seed + p * 7919 + s)
+      p_test <- predict(m_final, data = otest[, c("residual_PASI", top_feats)])$predictions
+      o_test <- otest$residual_PASI
+      
+      rmse_rf <- sqrt(mean((p_test - o_test)^2))
+      rmse_null <- sqrt(mean(o_test^2))
+      perm_skills[s] <- 1 - rmse_rf / rmse_null
+    }
+    
+    null_skills[p] <- mean(perm_skills)
+    
+    if (verbose && p %% 20 == 0)
+      cat(sprintf("    Perm %d/%d (mean null skill so far = %+.3f)\n",
+                  p, n_perm, mean(null_skills[seq_len(p)])))
+  }
+  
+  null_skills
+}
+
+build_rf_model <- function(features, sample_info,
+                           baseline_week = 0, followup_week = 12,
+                           n_outer = 20, outer_test_frac = 0.25,
+                           inner_n_splits = 10, inner_test_frac = 0.2,
+                           num_trees = 1000,
+                           seed = 42,
+                           rfe_drop_n = 1, rfe_min_features = 2,
+                           run_permutation = TRUE,
+                           n_perm = 100, perm_n_outer = 5,
+                           perm_num_trees = 500) {
+  set.seed(seed)
+  features <- as.data.frame(features)
+  
+  si <- sample_info %>% mutate(
+    week = as.numeric(as.character(week)),
+    PASI = as.numeric(as.character(PASI)),
+    drug = tolower(trimws(as.character(drug))),
+    patient = trimws(as.character(patient)),
+    sample_id = rownames(sample_info)
+  ) %>% dplyr::select(sample_id, patient, drug, week, PASI)
+  
+  bsl <- si %>% filter(week == baseline_week) %>%
+    group_by(patient, drug) %>% slice(1) %>% ungroup() %>%
+    rename(PASI_baseline = PASI, sid_bsl = sample_id)
+  fup <- si %>% filter(week == followup_week) %>%
+    group_by(patient, drug) %>% slice(1) %>% ungroup() %>%
+    rename(PASI_followup = PASI)
+  
+  delta <- inner_join(bsl, fup, by = c("patient", "drug")) %>%
+    mutate(delta_PASI = PASI_baseline - PASI_followup) %>%
+    filter(!is.na(delta_PASI), !is.na(PASI_baseline))
+  
+  arm_results <- list()
+  for (drug_nm in unique(delta$drug)) {
+    arm <- filter(delta, drug == drug_nm)
+    if (nrow(arm) < 10) next
+    
+    cat(sprintf("\n═══ %s (n=%d) ═══\n", toupper(drug_nm), nrow(arm)))
+    lm_fit_report <- lm(delta_PASI ~ PASI_baseline, data = arm)
+    
+    X <- features[arm$sid_bsl, , drop = FALSE]
+    df <- bind_cols(data.frame(delta_PASI = as.numeric(arm$delta_PASI),
+                               PASI_baseline = as.numeric(arm$PASI_baseline)), X)
+    df <- df[complete.cases(df), ]
+    if (nrow(df) < 10) next
+    
+    fcols <- colnames(X)
+    
+    cat(sprintf("  Running nested MC CV (n_outer=%d, test_frac=%.2f)...\n",
+                n_outer, outer_test_frac))
+    t0 <- Sys.time()
+    nested <- nested_rf_mc(df, fcols,
+                           n_outer = n_outer, outer_test_frac = outer_test_frac,
+                           inner_n_splits = inner_n_splits,
+                           inner_test_frac = inner_test_frac,
+                           num_trees = num_trees, seed = seed,
+                           rfe_drop_n = rfe_drop_n,
+                           rfe_min_features = rfe_min_features,
+                           verbose = FALSE)
+    cat(sprintf("  Nested CV done in %.1f min\n",
+                as.numeric(Sys.time() - t0, units = "mins")))
+    
+    if (is.null(nested)) next
+    
+    cat(sprintf("  → HONEST     skill = %+.3f ± %.3f\n",
+                nested$honest_skill_mean, nested$honest_skill_sd))
+    cat(sprintf("  → OPTIMISTIC skill = %+.3f ± %.3f (inner CV)\n",
+                nested$optimistic_skill_mean, nested$optimistic_skill_sd))
+    cat(sprintf("  → median feat count = %d (range %d–%d)\n",
+                as.integer(nested$median_n_features),
+                nested$feat_count_range[1], nested$feat_count_range[2]))
+    
+    perm <- NULL
+    if (run_permutation) {
+      cat(sprintf("  Running permutation null (n_perm=%d, fixed n_feats=%d)...\n",
+                  n_perm, as.integer(nested$median_n_features)))
+      t1 <- Sys.time()
+      null_skills <- permutation_null(df, fcols,
+                                      n_perm = n_perm,
+                                      n_outer = perm_n_outer,
+                                      outer_test_frac = outer_test_frac,
+                                      fixed_n_features = nested$median_n_features,
+                                      num_trees = perm_num_trees,
+                                      seed = seed,
+                                      verbose = TRUE)
+      p_value <- mean(null_skills >= nested$honest_skill_mean)
+      perm <- list(null_skills = null_skills,
+                   null_mean = mean(null_skills),
+                   null_sd = sd(null_skills),
+                   p_value = p_value,
+                   fixed_n_features = nested$median_n_features)
+      cat(sprintf("  Permutation done in %.1f min\n",
+                  as.numeric(Sys.time() - t1, units = "mins")))
+      cat(sprintf("  → permutation p = %.3f (null skill: %+.3f ± %.3f)\n",
+                  p_value, perm$null_mean, perm$null_sd))
+    }
+    
+    arm_results[[drug_nm]] <- c(
+      list(n_patients = nrow(df), baseline_lm = lm_fit_report,
+           drug = drug_nm),
+      nested,
+      list(permutation = perm,
+           # backward-compatible aliases for plotting
+           features = head(nested$importance_aggregated$feature,
+                           as.integer(nested$median_n_features)),
+           rmse_mean      = nested$honest_rmse_mean,
+           rmse_sd        = nested$honest_rmse_sd,
+           rmse_null_mean = nested$honest_rmse_null_mean,
+           rmse_null_sd   = nested$honest_rmse_null_sd,
+           skill_mean     = nested$honest_skill_mean,
+           skill_sd       = nested$honest_skill_sd,
+           importance     = nested$importance_aggregated,
+           predictions_patient = nested$predictions_all %>%
+             dplyr::mutate(pred_mean = residual_pred)
+      )
+    )
+  }
+  arm_results
+}
+
+##################################################################################
+################### PLOTS
+
+drug_colors   <- c("adalimumab" = "#2E86AB", "ustekinumab" = "#E63946")
+tissue_colors <- c("lesional" = "#C73E1D", "nonlesional" = "#F4A261",
+                   "blood" = "#2A9D8F")
+
+cap <- function(x) tools::toTitleCase(tolower(x))
+
+# Importance grid: shows mean importance + selection frequency
+plot_importance_grid <- function(all_results, top_n = 15, save_path = NULL) {
+  rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a) || is.null(a$importance)) next
+      top <- head(a$importance, top_n)
+      rows[[length(rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        feature = top$feature,
+        importance = top$importance,
+        selection_frequency = top$selection_frequency)
+    }
+  }
+  d <- bind_rows(rows)
+  d$tissue <- factor(cap(d$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  d$drug   <- factor(cap(d$drug))
+  d$panel_feature <- paste(d$tissue, d$drug, d$feature, sep = "|")
+  d <- d %>% arrange(tissue, drug, importance) %>%
+    mutate(panel_feature = factor(panel_feature, levels = panel_feature))
+  
+  named_drug_colors <- setNames(drug_colors, cap(names(drug_colors)))
+  
+  p <- ggplot(d, aes(importance, panel_feature,
+                     fill = drug, alpha = selection_frequency)) +
+    geom_col(color = "black", linewidth = 0.3) +
+    facet_grid(drug ~ tissue, scales = "free_y") +
+    scale_fill_manual(values = named_drug_colors, guide = "none") +
+    scale_alpha_continuous(range = c(0.3, 1), limits = c(0, 1),
+                           name = "Selection\nfrequency") +
+    scale_y_discrete(labels = function(x) sub("^.*\\|", "", x)) +
+    labs(title = "Eigengene Importance — Mean Across Outer Splits",
+         subtitle = "Bar opacity reflects how often a feature was retained by RFE",
+         x = "Mean permutation importance", y = NULL) +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"),
+          panel.grid.major.y = element_blank())
+  
+  if (!is.null(save_path)) ggsave(save_path, p, width = 12, height = 8, dpi = 300)
+  print(p); invisible(p)
+}
+
+plot_pred_vs_measured_grid <- function(all_results, save_path = NULL) {
+  rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a) || is.null(a$predictions_all)) next
+      d <- a$predictions_all
+      rows[[length(rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        obs = d$delta_PASI, pred = d$delta_pred)
+    }
+  }
+  d <- bind_rows(rows)
+  d$tissue <- factor(cap(d$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  d$drug   <- factor(cap(d$drug))
+  
+  named_drug_colors <- setNames(drug_colors, cap(names(drug_colors)))
+  
+  p <- ggplot(d, aes(obs, pred, color = drug)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "grey40") +
+    geom_point(size = 2, alpha = 0.55) +
+    facet_grid(drug ~ tissue) +
+    coord_equal() +
+    scale_color_manual(values = named_drug_colors, guide = "none") +
+    labs(title = "Predicted vs Measured ΔPASI (outer holdout only)",
+         x = "Measured ΔPASI", y = "Predicted ΔPASI") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"))
+  
+  if (!is.null(save_path)) ggsave(save_path, p, width = 11, height = 7, dpi = 300)
+  print(p); invisible(p)
+}
+
+plot_rfe_paths_combined <- function(all_results, save_path = NULL) {
+  rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a) || is.null(a$rfe_path_summary)) next
+      tmp <- a$rfe_path_summary
+      tmp$tissue <- tissue_nm; tmp$drug <- drug_nm
+      rows[[length(rows) + 1]] <- tmp
+    }
+  }
+  d <- bind_rows(rows)
+  d$tissue <- factor(cap(d$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  d$drug <- factor(cap(d$drug))
+  
+  named_tissue_colors <- setNames(tissue_colors, cap(names(tissue_colors)))
+  
+  p <- ggplot(d, aes(n_features, skill_mean, color = tissue, fill = tissue,
+                     group = tissue)) +
+    geom_hline(yintercept = 0, linetype = "dotted", color = "grey40") +
+    geom_ribbon(aes(ymin = skill_mean - skill_sd, ymax = skill_mean + skill_sd),
+                alpha = 0.15, color = NA) +
+    geom_line(linewidth = 0.9) +
+    geom_point(size = 1.8) +
+    facet_wrap(~ drug) +
+    scale_x_reverse() +
+    scale_color_manual(values = named_tissue_colors) +
+    scale_fill_manual(values = named_tissue_colors) +
+    labs(title = "Inner-CV Skill Score Across RFE Path",
+         subtitle = "Mean ± SD across outer splits",
+         x = "Number of features", y = "Inner-CV skill score",
+         color = "Tissue", fill = "Tissue") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"))
+  if (!is.null(save_path)) ggsave(save_path, p, width = 10, height = 5, dpi = 300)
+  print(p); invisible(p)
+}
+
+# RF vs null summary (now using honest outer-test metrics)
+plot_rf_vs_null_summary <- function(all_results, metric = c("rmse", "skill"),
+                                    save_path = NULL) {
+  metric <- match.arg(metric)
+  rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a)) next
+      rows[[length(rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        rmse_rf = a$honest_rmse_mean, rmse_rf_sd = a$honest_rmse_sd,
+        rmse_null = a$honest_rmse_null_mean, rmse_null_sd = a$honest_rmse_null_sd,
+        skill = a$honest_skill_mean, skill_sd = a$honest_skill_sd)
+    }
+  }
+  df <- bind_rows(rows)
+  df$tissue <- factor(cap(df$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  df$drug   <- factor(cap(df$drug))
+  
+  named_drug_colors <- setNames(drug_colors, cap(names(drug_colors)))
+  
+  if (metric == "rmse") {
+    plot_df <- df %>%
+      pivot_longer(c(rmse_rf, rmse_null), names_to = "model", values_to = "rmse") %>%
+      mutate(sd = ifelse(model == "rmse_rf", rmse_rf_sd, rmse_null_sd),
+             model = factor(model, levels = c("rmse_null", "rmse_rf"),
+                            labels = c("Null (baseline-PASI only)", "RF (eigengenes)")))
+    
+    p <- ggplot(plot_df, aes(drug, rmse, fill = drug, alpha = model)) +
+      geom_col(position = position_dodge(0.8), width = 0.7,
+               color = "black", linewidth = 0.3) +
+      geom_errorbar(aes(ymin = pmax(rmse - sd, 0), ymax = rmse + sd, group = model),
+                    position = position_dodge(0.8), width = 0.25,
+                    color = "grey30", alpha = 1) +
+      scale_fill_manual(values = named_drug_colors) +
+      scale_alpha_manual(values = c("Null (baseline-PASI only)" = 0.4,
+                                    "RF (eigengenes)" = 1.0)) +
+      facet_wrap(~ tissue) +
+      labs(title = "RF vs Null — Honest Outer-Holdout RMSE",
+           x = NULL, y = "Mean RMSE (± sd over outer splits)",
+           fill = "Drug", alpha = "Model") +
+      guides(fill = guide_legend(override.aes = list(alpha = 1), order = 1),
+             alpha = guide_legend(override.aes = list(fill = "grey50"), order = 2))
+  } else {
+    p <- ggplot(df, aes(drug, skill, fill = drug)) +
+      geom_col(width = 0.7, color = "black", linewidth = 0.3) +
+      geom_errorbar(aes(ymin = skill - skill_sd, ymax = skill + skill_sd),
+                    width = 0.25, color = "grey30") +
+      geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+      scale_fill_manual(values = named_drug_colors) +
+      facet_wrap(~ tissue) +
+      labs(title = "RF Skill Score — Honest Outer-Holdout",
+           x = NULL, y = "Skill score (± sd over outer splits)", fill = "Drug")
+  }
+  p <- p + theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "top",
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"))
+  if (!is.null(save_path)) ggsave(save_path, p, width = 11, height = 5, dpi = 300)
+  print(p); invisible(p)
+}
+
+plot_honest_vs_optimistic_skill <- function(all_results, save_path = NULL) {
+  rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a)) next
+      rows[[length(rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        kind = c("Optimistic (inner CV)", "Honest (outer holdout)"),
+        skill = c(a$optimistic_skill_mean, a$honest_skill_mean),
+        sd    = c(a$optimistic_skill_sd, a$honest_skill_sd))
+    }
+  }
+  d <- bind_rows(rows)
+  d$tissue <- factor(cap(d$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  d$drug   <- factor(cap(d$drug))
+  d$kind   <- factor(d$kind, levels = c("Optimistic (inner CV)",
+                                        "Honest (outer holdout)"))
+  
+  named_drug_colors <- setNames(drug_colors, cap(names(drug_colors)))
+  
+  p <- ggplot(d, aes(drug, skill, fill = drug, alpha = kind)) +
+    geom_col(position = position_dodge(0.8), width = 0.7,
+             color = "black", linewidth = 0.3) +
+    geom_errorbar(aes(ymin = skill - sd, ymax = skill + sd, group = kind),
+                  position = position_dodge(0.8), width = 0.25,
+                  color = "grey30", alpha = 1) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey40") +
+    scale_fill_manual(values = named_drug_colors) +
+    scale_alpha_manual(values = c("Optimistic (inner CV)" = 0.4,
+                                  "Honest (outer holdout)" = 1.0)) +
+    facet_wrap(~ tissue) +
+    labs(title = "Honest vs Optimistic Skill Score",
+         subtitle = "Gap = magnitude of selection / model-selection bias",
+         x = NULL, y = "Skill score (± sd)",
+         fill = "Drug", alpha = "Estimate type") +
+    guides(fill = guide_legend(override.aes = list(alpha = 1), order = 1),
+           alpha = guide_legend(override.aes = list(fill = "grey50"), order = 2)) +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "top",
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"))
+  if (!is.null(save_path)) ggsave(save_path, p, width = 11, height = 5, dpi = 300)
+  print(p); invisible(p)
+}
+
+# NEW: permutation null distributions vs observed honest skill
+plot_permutation_nulls <- function(all_results, save_path = NULL) {
+  rows <- list(); obs_rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a) || is.null(a$permutation)) next
+      rows[[length(rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        null_skill = a$permutation$null_skills)
+      obs_rows[[length(obs_rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        obs_skill = a$honest_skill_mean,
+        p_value = a$permutation$p_value)
+    }
+  }
+  if (length(rows) == 0) {
+    cat("No permutation results found.\n"); return(invisible(NULL))
+  }
+  d  <- bind_rows(rows)
+  do <- bind_rows(obs_rows)
+  d$tissue  <- factor(cap(d$tissue),  levels = c("Lesional", "Nonlesional", "Blood"))
+  d$drug    <- factor(cap(d$drug))
+  do$tissue <- factor(cap(do$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  do$drug   <- factor(cap(do$drug))
+  
+  p <- ggplot(d, aes(null_skill)) +
+    geom_histogram(bins = 25, fill = "grey70", color = "grey40",
+                   linewidth = 0.2) +
+    geom_vline(data = do, aes(xintercept = obs_skill),
+               color = "red", linewidth = 0.9) +
+    geom_text(data = do,
+              aes(x = obs_skill, y = Inf,
+                  label = sprintf("p=%.3f", p_value)),
+              vjust = 1.4, hjust = -0.1, size = 3.2, color = "red") +
+    facet_grid(drug ~ tissue) +
+    labs(title = "Permutation Null Distribution of Honest Skill",
+         subtitle = "Red line: observed honest skill on real data",
+         x = "Skill score under shuffled outcome", y = "Count") +
+    theme_bw(base_size = 11) +
+    theme(plot.title = element_text(face = "bold"),
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"))
+  
+  if (!is.null(save_path)) ggsave(save_path, p, width = 11, height = 7, dpi = 300)
+  print(p); invisible(p)
+}
+
+plot_delta_vs_baseline <- function(all_results, save_path = NULL) {
+  rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a) || is.null(a$predictions_all)) next
+      d <- a$predictions_all
+      rows[[length(rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        PASI_baseline = d$PASI_baseline, delta_PASI = d$delta_PASI)
+    }
+  }
+  d <- bind_rows(rows) %>% distinct()
+  d$tissue <- factor(cap(d$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  d$drug   <- factor(cap(d$drug))
+  
+  named_drug_colors <- setNames(drug_colors, cap(names(drug_colors)))
+  
+  p <- ggplot(d, aes(PASI_baseline, delta_PASI, color = drug)) +
+    geom_point(alpha = 0.75, size = 2) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+    facet_wrap(~ tissue) +
+    scale_color_manual(values = named_drug_colors) +
+    labs(title = "ΔPASI vs Baseline PASI",
+         x = "Baseline PASI", y = "ΔPASI (baseline − week 12)",
+         color = "Drug") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "top",
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"))
+  if (!is.null(save_path)) ggsave(save_path, p, width = 10, height = 4, dpi = 300)
+  print(p); invisible(p)
+}
+
+# Fixed typo: was `lot_pct_change_vs_baseline`
+plot_pct_change_vs_baseline <- function(all_results, save_path = NULL) {
+  rows <- list()
+  for (tissue_nm in names(all_results)) {
+    for (drug_nm in names(all_results[[tissue_nm]])) {
+      a <- all_results[[tissue_nm]][[drug_nm]]
+      if (is.null(a) || is.null(a$predictions_all)) next
+      d <- a$predictions_all
+      rows[[length(rows) + 1]] <- data.frame(
+        tissue = tissue_nm, drug = drug_nm,
+        PASI_baseline = d$PASI_baseline,
+        pct_change = 100 * d$delta_PASI / d$PASI_baseline)
+    }
+  }
+  d <- bind_rows(rows) %>% distinct()
+  d$tissue <- factor(cap(d$tissue), levels = c("Lesional", "Nonlesional", "Blood"))
+  d$drug   <- factor(cap(d$drug))
+  
+  named_drug_colors <- setNames(drug_colors, cap(names(drug_colors)))
+  
+  p <- ggplot(d, aes(PASI_baseline, pct_change, color = drug)) +
+    geom_hline(yintercept = 50, linetype = "dashed", color = "grey50") +
+    geom_point(size = 2, alpha = 0.75) +
+    facet_wrap(~ tissue) +
+    scale_color_manual(values = named_drug_colors) +
+    labs(title = "% Improvement vs Baseline PASI",
+         x = "Baseline PASI", y = "% improvement in PASI",
+         color = "Drug") +
+    theme_bw(base_size = 12) +
+    theme(plot.title = element_text(face = "bold"),
+          legend.position = "top",
+          strip.background = element_rect(fill = "grey95", color = NA),
+          strip.text = element_text(face = "bold"))
+  
+  if (!is.null(save_path)) ggsave(save_path, p, width = 10, height = 4, dpi = 300)
+  print(p); invisible(p)
+}
+
+# =============================================================================
+# === SAMMANFATTNING =========================================================
+
+print_arm_summary <- function(results, tissue) {
+  cat(sprintf("\n══ %s ══\n", toupper(tissue)))
+  for (nm in names(results)) {
+    a <- results[[nm]]
+    if (is.null(a)) next
+    cat(sprintf("\n%s (n=%d, %d outer splits):\n",
+                nm, a$n_patients, a$n_outer_splits))
+    cat(sprintf("  HONEST     : RMSE %.2f ± %.2f vs null %.2f | Skill %+.3f ± %.3f | p_pair=%.3f\n",
+                a$honest_rmse_mean, a$honest_rmse_sd,
+                a$honest_rmse_null_mean,
+                a$honest_skill_mean, a$honest_skill_sd, a$paired_p))
+    cat(sprintf("  OPTIMISTIC : Skill %+.3f ± %.3f (inner CV)\n",
+                a$optimistic_skill_mean, a$optimistic_skill_sd))
+    cat(sprintf("  Median feature count: %d (range %d–%d)\n",
+                as.integer(a$median_n_features),
+                a$feat_count_range[1], a$feat_count_range[2]))
+    if (!is.null(a$permutation)) {
+      cat(sprintf("  PERMUTATION: null skill = %+.3f ± %.3f, p = %.3f\n",
+                  a$permutation$null_mean, a$permutation$null_sd,
+                  a$permutation$p_value))
+    }
+    cat("  Top 10 features (by selection frequency):\n")
+    print(head(a$importance, 10))
+  }
+}
+
+# =============================================================================
+# === Load + run ==============================================================
+
+load_tissue_data <- function(tissue, output_dir = "rna_seq_outputs") {
+  MEs <- readRDS(file.path(output_dir, paste0("WGCNA_", tissue), "module_eigengenes.rds"))
+  si  <- readRDS(file.path(output_dir, paste0("WGCNA_", tissue), "sample_info.rds"))
+  if ("sample_id" %in% colnames(si)) rownames(si) <- si$sample_id
+  grey_cols <- grep("^MEgrey$|^ME0$", colnames(MEs), value = TRUE,
+                    ignore.case = TRUE)
+  if (length(grey_cols) > 0) {
+    MEs <- MEs[, !colnames(MEs) %in% grey_cols, drop = FALSE]
+    cat(sprintf("  Dropped %d unassigned-module eigengene(s): %s\n",
+                length(grey_cols), paste(grey_cols, collapse = ", ")))
+  }
+  
+  common <- intersect(rownames(si), rownames(MEs))
+  list(MEs = MEs[common, , drop = FALSE], sample_info = si[common, , drop = FALSE])
+}
+
+run_rf_for_tissue <- function(tissue, output_dir = "rna_seq_outputs", ...) {
+  dat <- load_tissue_data(tissue, output_dir)
+  res <- build_rf_model(dat$MEs, dat$sample_info, ...)
+  print_arm_summary(res, tissue)
+  saveRDS(res, file.path(output_dir, sprintf("rf_eigengene_%s_results.rds", tissue)))
+  invisible(res)
+}
+
+# KÖÖÖÖÖRR
+
+
+res_blood       <- run_rf_for_tissue("blood",
+                                     n_outer = 20, outer_test_frac = 0.25,
+                                     run_permutation = TRUE, n_perm = 100)
+res_lesional    <- run_rf_for_tissue("lesional",
+                                     n_outer = 20, outer_test_frac = 0.25,
+                                     run_permutation = TRUE, n_perm = 100)
+res_nonlesional <- run_rf_for_tissue("nonlesional",
+                                     n_outer = 20, outer_test_frac = 0.25,
+                                     run_permutation = TRUE, n_perm = 100)
+
+all_results <- list(blood = res_blood,
+                    lesional = res_lesional,
+                    nonlesional = res_nonlesional)
+
+# Plots
+plot_importance_grid(all_results,
+                     save_path = file.path(output_dir, "importance_grid.png"))
+plot_rf_vs_null_summary(all_results, metric = "rmse",
+                        save_path = file.path(output_dir, "summary_rmse_honest.png"))
+plot_rf_vs_null_summary(all_results, metric = "skill",
+                        save_path = file.path(output_dir, "summary_skill_honest.png"))
+plot_honest_vs_optimistic_skill(all_results,
+                                save_path = file.path(output_dir, "honest_vs_optimistic.png"))
+plot_rfe_paths_combined(all_results,
+                        save_path = file.path(output_dir, "rfe_paths_meanSD.png"))
+plot_pred_vs_measured_grid(all_results,
+                           save_path = file.path(output_dir, "pred_vs_measured_grid.png"))
+plot_permutation_nulls(all_results,
+                       save_path = file.path(output_dir, "permutation_nulls.png"))
+plot_delta_vs_baseline(all_results,
+                       save_path = file.path(output_dir, "delta_vs_baseline.png"))
+plot_pct_change_vs_baseline(all_results,
+                            save_path = file.path(output_dir, "pct_change_vs_baseline.png"))
