@@ -1,0 +1,292 @@
+library(WGCNA)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+disableWGCNAThreads()
+output_dir <- "rna_seq_outputs"
+
+#PARAMETRAR SAMLADE HÄR
+tissue_params <- list(
+  lesional = list(
+    r2_threshold        = 0.85,
+    soft_power_override = NULL,
+    min_module_size     = 25,
+    merge_cut_height    = 0.25),
+  nonlesional = list(
+    r2_threshold        = 0.85,
+    soft_power_override = NULL,
+    min_module_size     = 25,
+    merge_cut_height    = 0.25),
+  blood = list(
+    r2_threshold        = 0.85,
+    soft_power_override = NULL,
+    min_module_size     = 25,
+    merge_cut_height    = 0.25)
+)
+# funktion
+run_wgcna <- function(expr_wgcna, sample_info, tissue_label, wgcna_dir,
+                      r2_threshold, soft_power_override,
+                      min_module_size, merge_cut_height) {
+  #skapar mapp
+  if (!dir.exists(wgcna_dir)) dir.create(wgcna_dir, recursive = TRUE)
+  
+  
+  cat("\nWGCNA —", tissue_label)
+  cat(nrow(expr_wgcna), "samples x", ncol(expr_wgcna), "genes\n")
+  
+  # ser till att det inte finns konstiga N/A ellr 0 var samples
+  gsg <- goodSamplesGenes(expr_wgcna, verbose = 1)
+  if (!gsg$allOK) {
+    expr_wgcna  <- expr_wgcna[gsg$goodSamples, gsg$goodGenes]
+    sample_info <- sample_info[gsg$goodSamples, ]
+  }
+  gc()
+
+  # Sample tree
+  png(file.path(wgcna_dir, "01_sample_clustering.png"))
+  plot(hclust(dist(expr_wgcna), method = "average"),
+       main = paste(tissue_label, "— sample clustering"), sub = "", xlab = "", labels = FALSE)
+  dev.off()
+  gc()
+  
+  # THRESHOLD
+  powers  <- c(1:10, seq(12, 20, 2))
+  sft     <- pickSoftThreshold(expr_wgcna, powerVector = powers,
+                               networkType = "signed", verbose = 1, blockSize = 5400)
+  r2_vals <- -sign(sft$fitIndices[, 3]) * sft$fitIndices[, 2]
+  
+  #genererar tabell för att se vad som sker i picksoftthreshold
+  cat("\npower | R2    | slope | mean_k\n")
+  for (i in seq_along(powers)) {
+    cat(sprintf("  %3d  | %.3f | %5.2f | %.1f\n",
+                powers[i], r2_vals[i], sft$fitIndices[i, 3], sft$fitIndices[i, 5]))
+  }
+  
+  png(file.path(wgcna_dir, "02_soft_threshold.png"))
+  par(mfrow = c(1, 2))
+  plot(powers, r2_vals, type = "b", xlab = "Power", ylab = "R²",
+       main = paste(tissue_label, "scale independence"))
+  abline(h = r2_threshold, col = "red", lty = 2)
+  plot(powers, sft$fitIndices[, 5], type = "b", xlab = "Power", ylab = "Mean k",
+       main = "Mean connectivity")
+  dev.off()
+  
+  softPower <- sft$fitIndices[which(r2_vals >= r2_threshold)[1], 1]
+  if (is.na(softPower)) softPower <- 12
+  if (!is.null(soft_power_override)) softPower <- soft_power_override
+  cat("Using soft power:", softPower, "\n")
+  rm(sft, r2_vals); gc()
+  
+  # Network
+  net <- blockwiseModules(
+    expr_wgcna,
+    power = softPower, 
+    networkType = "signed", 
+    TOMType = "signed",
+    minModuleSize = min_module_size,
+    mergeCutHeight = merge_cut_height,
+    reassignThreshold = 1e-6,
+    numericLabels = FALSE,
+    maxBlockSize = 7600, 
+    saveTOMs = TRUE,
+    saveTOMFileBase = file.path(wgcna_dir, "TOM"),
+    verbose = 1,
+    deepSplit = 2)
+  gc()
+  
+  moduleColors <- net$colors
+  n_grey <- sum(moduleColors == "grey")
+  cat("\nModule sizes:\n"); print(sort(table(moduleColors), decreasing = TRUE))
+  cat("Assigned:", length(moduleColors) - n_grey, "| Grey:", n_grey, "\n\n")
+  
+  write.csv(data.frame(gene = names(moduleColors), module = moduleColors),
+            file.path(wgcna_dir, "gene_module_assignments.csv"), row.names = FALSE)
+  
+  png(file.path(wgcna_dir, "03_dendrogram.png"))
+  plotDendroAndColors(net$dendrograms[[1]], moduleColors[net$blockGenes[[1]]],
+                      "Modules", dendroLabels = FALSE, hang = 0.03,
+                      main = paste(tissue_label, "| power =", softPower))
+  dev.off()
+  
+  # Eigengenes
+  MEs <- orderMEs(moduleEigengenes(expr_wgcna, moduleColors)$eigengenes)
+  gc()
+  
+  # Trait matrix
+  datTraits <- data.frame(week = as.numeric(as.character(sample_info$week)),
+                          row.names = rownames(sample_info))
+  if ("PASI"      %in% colnames(sample_info)) datTraits$PASI      <- as.numeric(sample_info$PASI)
+  if ("age"       %in% colnames(sample_info)) datTraits$age       <- as.numeric(sample_info$age)
+  if ("sex"       %in% colnames(sample_info)) datTraits$sex       <- as.integer(sample_info$sex == "Female")
+  if ("HLA_C0602" %in% colnames(sample_info)) datTraits$HLA_C0602 <- as.numeric(sample_info$HLA_C0602)
+  if ("drug" %in% colnames(sample_info) && nlevels(factor(sample_info$drug)) > 1) {
+    dm <- model.matrix(~ drug - 1, data = sample_info)
+    colnames(dm) <- gsub("drug", "", colnames(dm))
+    datTraits <- cbind(datTraits, dm)
+  }
+  
+  # KARTA
+  moduleTraitCor  <- cor(MEs, datTraits, use = "p")
+  moduleTraitPval <- corPvalueStudent(moduleTraitCor, nrow(expr_wgcna))
+  textMatrix      <- paste0(signif(moduleTraitCor, 2), "\n(", signif(moduleTraitPval, 1), ")")
+  dim(textMatrix) <- dim(moduleTraitCor)
+  
+  png(file.path(wgcna_dir, "04_module_trait_heatmap.png"), width = 1200,
+      height =1000, res = 150)
+      
+
+  par(mar = c(8, 10, 3, 3))
+  labeledHeatmap(Matrix = moduleTraitCor,
+                 xLabels = colnames(datTraits), yLabels = names(MEs),
+                 ySymbols = names(MEs), colorLabels = FALSE,
+                 colors = blueWhiteRed(50), textMatrix = NULL,
+                 setStdMargins = FALSE, cex.lab.y = 0.6, cex.lab.x = 0.7,
+                 zlim = c(-1, 1),
+                 main = paste("Module-trait —", tissue_label))
+  dev.off()
+  gc()
+  
+  # Eigengene trajectories
+  traj_df <- MEs %>%
+    as.data.frame() %>%
+    mutate(week = sample_info$week) %>%
+    pivot_longer(-week, names_to = "module", values_to = "eigengene") %>%
+    filter(module != "MEgrey")
+  
+  ggsave(file.path(wgcna_dir, "05_eigengene_trajectories.png"),
+         ggplot(traj_df, aes(x = week, y = eigengene, fill = week)) +
+           geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+           geom_jitter(width = 0.15, size = 0.7, alpha = 0.5) +
+           facet_wrap(~ module, scales = "free_y") +
+           scale_fill_brewer(palette = "Dark2") +
+           labs(title = tissue_label, x = "Week", y = "Eigengene") +
+           theme_bw(base_size = 10) +
+           theme(panel.grid = element_blank(), strip.text = element_text(face = "bold")),
+         width = 14, height = 10, dpi = 300)
+  rm(traj_df); gc()
+  
+  # Save
+  saveRDS(list(soft_power = softPower, min_module_size = min_module_size,
+               merge_cut_height = merge_cut_height,
+               n_modules = length(unique(moduleColors)) - 1,
+               pct_grey  = round(100 * n_grey / length(moduleColors), 1)),
+          file.path(wgcna_dir, "params_used.rds"))
+  saveRDS(MEs,         file.path(wgcna_dir, "module_eigengenes.rds"))
+  saveRDS(moduleColors,file.path(wgcna_dir, "module_colors.rds"))
+  saveRDS(datTraits,   file.path(wgcna_dir, "trait_matrix.rds"))
+  saveRDS(sample_info, file.path(wgcna_dir, "sample_info.rds"))
+  write.csv(as.data.frame(moduleTraitCor) %>% mutate(module = rownames(.)),
+            file.path(wgcna_dir, "module_trait_correlations.csv"), row.names = TRUE)
+  rm(net); gc()
+  
+  cat(tissue_label, "done.\n")
+  return(list(MEs = MEs, moduleColors = moduleColors,
+              datTraits = datTraits, sample_info = sample_info))
+}
+
+#  KÖÖÖR ======================================================================
+cat("Loading lesional\n")
+expr_tmp        <- readRDS(file.path(output_dir, "expr_wgcna_lesional.rds"))
+sample_info_tmp <- readRDS(file.path(output_dir, "sample_info_lesional.rds"))
+results_lesional <- run_wgcna(expr_tmp, sample_info_tmp, "Lesional Skin",
+                              file.path(output_dir, "WGCNA_lesional"),
+                              tissue_params$lesional$r2_threshold,
+                              tissue_params$lesional$soft_power_override,
+                              tissue_params$lesional$min_module_size,
+                              tissue_params$lesional$merge_cut_height)
+rm(expr_tmp, sample_info_tmp); gc()
+
+cat("Loading nonlesional\n")
+expr_tmp        <- readRDS(file.path(output_dir, "expr_wgcna_nonlesional.rds"))
+sample_info_tmp <- readRDS(file.path(output_dir, "sample_info_nonlesional.rds"))
+results_nonlesional <- run_wgcna(expr_tmp, sample_info_tmp, "Nonlesional Skin",
+                                 file.path(output_dir, "WGCNA_nonlesional"),
+                                 tissue_params$nonlesional$r2_threshold,
+                                 tissue_params$nonlesional$soft_power_override,
+                                 tissue_params$nonlesional$min_module_size,
+                                 tissue_params$nonlesional$merge_cut_height)
+rm(expr_tmp, sample_info_tmp); gc()
+
+cat("Loading blood\n")
+expr_tmp        <- readRDS(file.path(output_dir, "expr_wgcna_blood.rds"))
+sample_info_tmp <- readRDS(file.path(output_dir, "sample_info_blood.rds"))
+results_blood <- run_wgcna(expr_tmp, sample_info_tmp, "Blood",
+                           file.path(output_dir, "WGCNA_blood"),
+                           tissue_params$blood$r2_threshold,
+                           tissue_params$blood$soft_power_override,
+                           tissue_params$blood$min_module_size,
+                           tissue_params$blood$merge_cut_height)
+rm(expr_tmp, sample_info_tmp); gc()
+
+# CROSS-TISSUE CORRELATION
+cat("\nCross-tissue eigengene correlation...\n")
+
+get_ME_with_key <- function(results, label) {
+  si <- results$sample_info
+  me <- results$MEs %>% as.data.frame() %>% dplyr::select(-matches("grey"))
+  me$patient_week <- paste0(si$patient, "_w", si$week)
+  me$patient <- as.character(si$patient)
+  me$week    <- as.character(si$week)
+  return(me)
+}
+
+ME_lesional    <- get_ME_with_key(results_lesional,    "lesional")
+ME_nonlesional <- get_ME_with_key(results_nonlesional, "nonlesional")
+ME_blood       <- get_ME_with_key(results_blood,       "blood")
+
+common_keys <- Reduce(intersect, list(ME_lesional$patient_week,
+                                      ME_nonlesional$patient_week,
+                                      ME_blood$patient_week))
+cat("Matched patient-week combinations:", length(common_keys), "\n")
+
+if (length(common_keys) >= 5) {
+  
+  drop_cols <- c("patient_week", "patient", "week")
+  align     <- function(me, keys) me[match(keys, me$patient_week),
+                                     !colnames(me) %in% drop_cols]
+  
+  ME_les_mat <- align(ME_lesional,    common_keys); colnames(ME_les_mat) <- paste0("Les_",    colnames(ME_les_mat))
+  ME_non_mat <- align(ME_nonlesional, common_keys); colnames(ME_non_mat) <- paste0("NonLes_", colnames(ME_non_mat))
+  ME_blo_mat <- align(ME_blood,       common_keys); colnames(ME_blo_mat) <- paste0("Blood_",  colnames(ME_blo_mat))
+  
+  cross_cor <- cor(cbind(ME_les_mat, ME_non_mat, ME_blo_mat), use = "p")
+  
+  les_cols <- grep("^Les_",    colnames(cross_cor))
+  non_cols <- grep("^NonLes_", colnames(cross_cor))
+  blo_cols <- grep("^Blood_",  colnames(cross_cor))
+  
+  cross_dir <- file.path(output_dir, "WGCNA_cross_tissue")
+  if (!dir.exists(cross_dir)) dir.create(cross_dir)
+  
+  plot_cross <- function(mat, title, fname) {
+    df <- as.data.frame(mat) %>%
+      mutate(row_module = rownames(mat)) %>%
+      pivot_longer(-row_module, names_to = "col_module", values_to = "cor")
+    ggsave(file.path(cross_dir, fname),
+           ggplot(df, aes(col_module, row_module, fill = cor)) +
+             geom_tile(color = "white") +
+             geom_text(aes(label = round(cor, 2)), size = 3) +
+             scale_fill_gradient2(low = "#d73027", mid = "white", high = "#2166ac",
+                                  midpoint = 0, limits = c(-1, 1)) +
+             labs(title = title, x = NULL, y = NULL) +
+             theme_bw(base_size = 11) +
+             theme(axis.text.x = element_text(angle = 45, hjust = 1), panel.grid = element_blank()),
+           width  = max(6, 0.6 * ncol(mat) + 3),
+           height = max(5, 0.5 * nrow(mat) + 2), dpi = 300)
+  }
+
+  plot_cross(cross_cor[les_cols, blo_cols], "Lesional vs Blood",       "cor_lesional_vs_blood.png")
+  plot_cross(cross_cor[les_cols, non_cols], "Lesional vs Nonlesional", "cor_lesional_vs_nonlesional.png")
+  plot_cross(cross_cor[non_cols, blo_cols], "Nonlesional vs Blood",    "cor_nonlesional_vs_blood.png")
+  
+  write.csv(as.data.frame(cross_cor),
+            file.path(cross_dir, "cross_tissue_ME_correlations.csv"))
+  gc()
+  cat("Cross-tissue plots saved.\n")
+  
+} else {
+  cat("Too few matched samples .\n")
+}
+
+cat("\nDone. Outputs in rna_seq_outputs/WGCNA_*/\n")
