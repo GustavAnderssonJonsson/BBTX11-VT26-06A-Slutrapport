@@ -1,0 +1,475 @@
+library(limma)
+library(edgeR)
+library(ggplot2)
+library(umap)
+library(biomaRt)
+library(variancePartition)
+library(BiocParallel)
+
+
+output_dir <- "rna_seq_outputs"
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir)
+  cat("Created output directory:", output_dir, "\n")
+}
+
+#  HÄMTAR
+
+blood_raw   <- read.delim("Blood_raw_counts_d.txt", check.names = FALSE)
+skin_d_raw  <- read.delim("Skin_raw_counts_d.txt", check.names = FALSE)
+skin_r_raw  <- read.delim("Skin_raw_counts_r.txt", check.names = FALSE)
+
+cat("Raw count files loaded:\n")
+cat("Blood:  ", nrow(blood_raw), "genes x", ncol(blood_raw), "samples\n")
+cat("Skin_d: ", nrow(skin_d_raw), "genes x", ncol(skin_d_raw), "samples\n")
+cat("Skin_r: ", nrow(skin_r_raw), "genes x", ncol(skin_r_raw), "samples\n")
+
+
+#  SKAPAR ORDNING
+
+
+sdrf <- read.delim("E-MTAB-14509.sdrf.txt", check.names = FALSE,
+                   stringsAsFactors = FALSE)
+colnames(sdrf) <- trimws(colnames(sdrf))
+
+cols_keep <- c(
+  "Source Name",
+  "Characteristics[individual]",
+  "Characteristics[organism]",
+  "Characteristics[age]",
+  "Characteristics[sex]",
+  "Characteristics[organism part]",
+  "Characteristics[disease]",
+  "Characteristics[drug]",
+  "Characteristics[psoriasis area severity index (pasi)]",
+  "Characteristics[disease onset type]",
+  "Characteristics[age of onset]",
+  "Characteristics[biologic naive patient]",
+  "Characteristics[anti tnf naive patient]",
+  "Characteristics[psoriatic arthritis]",
+  "Characteristics[body mass index]",
+  "Characteristics[hla_c0602 carrier]",
+  "Factor Value[time]"
+)
+
+cols_keep  <- cols_keep[cols_keep %in% colnames(sdrf)]
+sdrf_clean <- sdrf[, cols_keep]
+
+all_new_names <- c(
+  "sample_id", "patient", "organism", "age", "sex", "tissue",
+  "disease", "drug", "PASI", "onset_type", "age_of_onset",
+  "biologic_naive", "anti_tnf_naive", "psoriatic_arthritis",
+  "BMI", "HLA_C0602", "week"
+)
+colnames(sdrf_clean) <- all_new_names[seq_along(cols_keep)]
+
+cat("\nMetadata columns found:", length(cols_keep), "out of 17\n")
+
+# Helper function for type conversion
+fix_if_exists <- function(df, col, fn, ...) {
+  if (col %in% colnames(df)) df[[col]] <- fn(df[[col]], ...)
+  return(df)
+}
+
+#  BLOOD DATA
+
+
+#  Remove controls 
+controls    <- c("PSORT-P3-UHR", "PSORT-P4-UHR")
+blood_raw   <- blood_raw[, !colnames(blood_raw) %in% controls]
+blood_samples <- colnames(blood_raw)
+
+cat("Blood samples after control removal:", length(blood_samples), "\n")
+
+#  Match to metadata 
+sdrf_blood <- sdrf_clean[grepl("02$", sdrf_clean$sample_id), ]
+sample_key_blood <- sub("..$", "", blood_samples)
+sdrf_blood$match_key <- sub("..$", "", sdrf_blood$sample_id)
+
+keep_blood <- blood_samples[sample_key_blood %in% sdrf_blood$match_key]
+blood_raw  <- blood_raw[, keep_blood]
+blood_samples <- colnames(blood_raw)
+sample_key_blood <- sub("..$", "", blood_samples)
+
+matched_idx <- match(sample_key_blood, sdrf_blood$match_key)
+sample_info_blood <- sdrf_blood[matched_idx, ]
+rownames(sample_info_blood) <- blood_samples
+
+cat("Blood samples with metadata:", nrow(sample_info_blood), "\n")
+
+#  Fix metadata types 
+sample_info_blood <- fix_if_exists(sample_info_blood, "patient", factor)
+sample_info_blood <- fix_if_exists(sample_info_blood, "week", function(x) factor(as.integer(x)))
+sample_info_blood <- fix_if_exists(sample_info_blood, "sex", factor, levels = c(0,1), labels = c("Male","Female"))
+sample_info_blood <- fix_if_exists(sample_info_blood, "drug", factor)
+sample_info_blood <- fix_if_exists(sample_info_blood, "disease", factor)
+sample_info_blood <- fix_if_exists(sample_info_blood, "age", as.numeric)
+sample_info_blood <- fix_if_exists(sample_info_blood, "PASI", as.numeric)
+sample_info_blood <- fix_if_exists(sample_info_blood, "BMI", as.numeric)
+
+# 3d. Sample QC 
+dge_blood <- DGEList(counts = as.matrix(blood_raw))
+dge_blood <- calcNormFactors(dge_blood, method = "TMM")
+norm_factors_blood <- dge_blood$samples$norm.factors
+
+cat("\nBlood TMM norm factors:\n")
+print(summary(norm_factors_blood))
+
+outliers_blood <- names(norm_factors_blood[norm_factors_blood > 2.0 | norm_factors_blood < 0.5])
+cat("Blood outliers removed:", length(outliers_blood), "\n")
+if(length(outliers_blood) > 0) print(outliers_blood)
+
+good_blood <- colnames(dge_blood)[!colnames(dge_blood) %in% outliers_blood]
+dge_blood <- dge_blood[, good_blood]
+sample_info_blood <- sample_info_blood[good_blood, ]
+
+cat("Blood samples after QC:", ncol(dge_blood), "\n")
+
+#  3e. Gene filtering 
+keep_blood <- filterByExpr(dge_blood, min.count = 10, group = sample_info_blood$week)
+dge_blood  <- dge_blood[keep_blood, , keep.lib.sizes = FALSE]
+
+cat("Blood genes after filtering:", nrow(dge_blood), "\n")
+
+# 3f. Final normalization and voom 
+dge_blood <- calcNormFactors(dge_blood, method = "TMM")
+design_blood <- model.matrix(~ 1, data = sample_info_blood)
+v_blood <- voom(dge_blood, design_blood, plot = TRUE)
+
+expr_blood   <- t(v_blood$E)  # samples x genes
+cat("Blood final matrix:", nrow(expr_blood), "samples x", ncol(expr_blood), "genes\n")
+
+# MEST VARIANTA 15000
+
+n_genes <- 15000
+form <- ~ (1|patient) + (1|week) + (1|drug)
+varPart_blood <- fitExtractVarPartModel(t(expr_blood), form, sample_info_blood,
+                                        BPPARAM = SnowParam(2))
+treatment_var_blood  <- varPart_blood$week + varPart_blood$drug
+top_genes_blood      <- names(sort(treatment_var_blood, decreasing=TRUE)[1:min(n_genes, nrow(varPart_blood))])
+expr_wgcna_blood     <- expr_blood[, top_genes_blood]
+cat("Blood WGCNA matrix:", ncol(expr_wgcna_blood), "genes\n")
+
+########
+saveRDS(expr_blood, file.path(output_dir, "expr_blood.rds"))
+saveRDS(expr_wgcna_blood, file.path(output_dir, "expr_wgcna_blood.rds"))
+saveRDS(sample_info_blood, file.path(output_dir, "sample_info_blood.rds"))
+
+# LESION
+
+cat("\n\n═══════════════════════════════════════════════════════════════════════════════\n")
+cat("KÖR LESIONER\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# ── 4a. Combine skin_d and skin_r, then filter to lesional (05) ───────────────
+# Find common genes between skin_d and skin_r
+common_skin_genes <- intersect(rownames(skin_d_raw), rownames(skin_r_raw))
+skin_d_subset <- skin_d_raw[common_skin_genes, ]
+skin_r_subset <- skin_r_raw[common_skin_genes, ]
+skin_combined <- cbind(skin_d_subset, skin_r_subset)
+
+cat("Skin files merged:", ncol(skin_combined), "samples x", nrow(skin_combined), "genes\n")
+
+# Remove controls
+skin_combined <- skin_combined[, !colnames(skin_combined) %in% controls]
+
+# Filter to lesional samples only (tissue code 05)
+skin_samples <- colnames(skin_combined)
+tissue_codes <- substr(sub(".*-", "", skin_samples), 3, 4)
+lesional_samples <- skin_samples[tissue_codes == "05"]
+
+lesional_raw <- skin_combined[, lesional_samples]
+cat("Lesional samples:", length(lesional_samples), "\n")
+
+# MATCHAR ALLT
+sdrf_lesional <- sdrf_clean[grepl("05$", sdrf_clean$sample_id), ]
+sample_key_lesional <- sub("..$", "", lesional_samples)
+sdrf_lesional$match_key <- sub("..$", "", sdrf_lesional$sample_id)
+
+keep_lesional <- lesional_samples[sample_key_lesional %in% sdrf_lesional$match_key]
+lesional_raw  <- lesional_raw[, keep_lesional]
+lesional_samples <- colnames(lesional_raw)
+sample_key_lesional <- sub("..$", "", lesional_samples)
+
+matched_idx <- match(sample_key_lesional, sdrf_lesional$match_key)
+sample_info_lesional <- sdrf_lesional[matched_idx, ]
+rownames(sample_info_lesional) <- lesional_samples
+
+cat("Lesional samples with metadata:", nrow(sample_info_lesional), "\n")
+
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "patient", factor)
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "week", function(x) factor(as.integer(x)))
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "sex", factor, levels = c(0,1), labels = c("Male","Female"))
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "drug", factor)
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "disease", factor)
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "age", as.numeric)
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "PASI", as.numeric)
+sample_info_lesional <- fix_if_exists(sample_info_lesional, "BMI", as.numeric)
+
+dge_lesional <- DGEList(counts = as.matrix(lesional_raw))
+dge_lesional <- calcNormFactors(dge_lesional, method = "TMM")
+norm_factors_lesional <- dge_lesional$samples$norm.factors
+
+cat("\nLesional TMM norm factors:\n")
+print(summary(norm_factors_lesional))
+
+outliers_lesional <- names(norm_factors_lesional[norm_factors_lesional > 2.0 | norm_factors_lesional < 0.5])
+cat("Lesional outliers removed:", length(outliers_lesional), "\n")
+if(length(outliers_lesional) > 0) print(outliers_lesional)
+
+good_lesional <- colnames(dge_lesional)[!colnames(dge_lesional) %in% outliers_lesional]
+dge_lesional <- dge_lesional[, good_lesional]
+sample_info_lesional <- sample_info_lesional[good_lesional, ]
+
+cat("Lesional samples after QC:", ncol(dge_lesional), "\n")
+
+#  Gene filtering 
+keep_lesional <- filterByExpr(dge_lesional, min.count = 10, group = sample_info_lesional$week)
+dge_lesional  <- dge_lesional[keep_lesional, , keep.lib.sizes = FALSE]
+
+cat("Lesional genes after filtering:", nrow(dge_lesional), "\n")
+
+#  Final normalization and voom 
+dge_lesional <- calcNormFactors(dge_lesional, method = "TMM")
+design_lesional <- model.matrix(~ 1, data = sample_info_lesional)
+v_lesional <- voom(dge_lesional, design_lesional, plot = TRUE)
+
+expr_lesional <- t(v_lesional$E)
+cat("Lesional final matrix:", nrow(expr_lesional), "samples x", ncol(expr_lesional), "genes\n")
+
+#  Filter to top variable genes 
+varPart_lesional <- fitExtractVarPartModel(t(expr_lesional), form, sample_info_lesional,
+                                           BPPARAM = SnowParam(4))
+treatment_var_lesional  <- varPart_lesional$week + varPart_lesional$drug
+top_genes_lesional      <- names(sort(treatment_var_lesional, decreasing=TRUE)[1:min(n_genes, nrow(varPart_lesional))])
+expr_wgcna_lesional     <- expr_lesional[, top_genes_lesional]
+cat("Lesional WGCNA matrix:", ncol(expr_wgcna_lesional), "genes\n")
+
+
+# ── 4h. Save lesional outputs 
+saveRDS(expr_lesional, file.path(output_dir, "expr_lesional.rds"))
+saveRDS(expr_wgcna_lesional, file.path(output_dir, "expr_wgcna_lesional.rds"))
+saveRDS(sample_info_lesional, file.path(output_dir, "sample_info_lesional.rds"))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+
+cat("HUD\n")
+cat("═══════════════════════════════════════════════════════════════════════════════\n\n")
+
+# Filter to nonlesional samples KOD 06
+nonlesional_samples <- skin_samples[tissue_codes == "06"]
+nonlesional_raw <- skin_combined[, nonlesional_samples]
+cat("Nonlesional samples:", length(nonlesional_samples), "\n")
+
+#  Match to metadata 
+sdrf_nonlesional <- sdrf_clean[grepl("06$", sdrf_clean$sample_id), ]
+sample_key_nonlesional <- sub("..$", "", nonlesional_samples)
+sdrf_nonlesional$match_key <- sub("..$", "", sdrf_nonlesional$sample_id)
+
+keep_nonlesional <- nonlesional_samples[sample_key_nonlesional %in% sdrf_nonlesional$match_key]
+nonlesional_raw  <- nonlesional_raw[, keep_nonlesional]
+nonlesional_samples <- colnames(nonlesional_raw)
+sample_key_nonlesional <- sub("..$", "", nonlesional_samples)
+
+matched_idx <- match(sample_key_nonlesional, sdrf_nonlesional$match_key)
+sample_info_nonlesional <- sdrf_nonlesional[matched_idx, ]
+rownames(sample_info_nonlesional) <- nonlesional_samples
+
+cat("Nonlesional samples with metadata:", nrow(sample_info_nonlesional), "\n")
+
+# ── 5c. Fix metadata types ─────────────────────────────────────────────────────
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "patient", factor)
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "week", function(x) factor(as.integer(x)))
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "sex", factor, levels = c(0,1), labels = c("Male","Female"))
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "drug", factor)
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "disease", factor)
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "age", as.numeric)
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "PASI", as.numeric)
+sample_info_nonlesional <- fix_if_exists(sample_info_nonlesional, "BMI", as.numeric)
+
+# Sample QC 
+dge_nonlesional <- DGEList(counts = as.matrix(nonlesional_raw))
+dge_nonlesional <- calcNormFactors(dge_nonlesional, method = "TMM")
+norm_factors_nonlesional <- dge_nonlesional$samples$norm.factors
+
+cat("\nNonlesional TMM norm factors:\n")
+print(summary(norm_factors_nonlesional))
+
+outliers_nonlesional <- names(norm_factors_nonlesional[norm_factors_nonlesional > 2.0 | norm_factors_nonlesional < 0.5])
+cat("Nonlesional outliers removed:", length(outliers_nonlesional), "\n")
+if(length(outliers_nonlesional) > 0) print(outliers_nonlesional)
+
+good_nonlesional <- colnames(dge_nonlesional)[!colnames(dge_nonlesional) %in% outliers_nonlesional]
+dge_nonlesional <- dge_nonlesional[, good_nonlesional]
+sample_info_nonlesional <- sample_info_nonlesional[good_nonlesional, ]
+
+cat("Nonlesional samples after QC:", ncol(dge_nonlesional), "\n")
+
+#  Gene filtering 
+keep_nonlesional <- filterByExpr(dge_nonlesional, min.count = 10, group = sample_info_nonlesional$week)
+dge_nonlesional  <- dge_nonlesional[keep_nonlesional, , keep.lib.sizes = FALSE]
+
+cat("Nonlesional genes after filtering:", nrow(dge_nonlesional), "\n")
+
+#  Final normalization and voom 
+dge_nonlesional <- calcNormFactors(dge_nonlesional, method = "TMM")
+design_nonlesional <- model.matrix(~ 1, data = sample_info_nonlesional)
+v_nonlesional <- voom(dge_nonlesional, design_nonlesional, plot = TRUE)
+
+expr_nonlesional <- t(v_nonlesional$E)
+cat("Nonlesional final matrix:", nrow(expr_nonlesional), "samples x", ncol(expr_nonlesional), "genes\n")
+
+#  Filter to top variable genes 
+varPart_nonlesional <- fitExtractVarPartModel(t(expr_nonlesional), form, sample_info_nonlesional,
+                                              BPPARAM = SnowParam(4))
+treatment_var_nonlesional  <- varPart_nonlesional$week + varPart_nonlesional$drug
+top_genes_nonlesional      <- names(sort(treatment_var_nonlesional, decreasing=TRUE)[1:min(n_genes, nrow(varPart_nonlesional))])
+expr_wgcna_nonlesional     <- expr_nonlesional[, top_genes_nonlesional]
+cat("Nonlesional WGCNA matrix:", ncol(expr_wgcna_nonlesional), "genes\n")
+
+#  Save nonlesional outputs 
+saveRDS(expr_nonlesional, file.path(output_dir, "expr_nonlesional.rds"))
+saveRDS(expr_wgcna_nonlesional, file.path(output_dir, "expr_wgcna_nonlesional.rds"))
+saveRDS(sample_info_nonlesional, file.path(output_dir, "sample_info_nonlesional.rds"))
+
+
+
+
+# . Add tissue column to each metadata file ───────────────────────────────
+sample_info_blood$tissue_type       <- "Blood"
+sample_info_lesional$tissue_type    <- "Lesional"
+sample_info_nonlesional$tissue_type <- "Nonlesional"
+
+# ── 6b. Combine into one master metadata file ──────────────────────────────────
+sample_info_all <- rbind(
+  sample_info_blood,
+  sample_info_lesional,
+  sample_info_nonlesional
+)
+
+# Convert tissue to factor with proper levels
+sample_info_all$tissue_type <- factor(sample_info_all$tissue_type,
+                                      levels = c("Blood", "Lesional", "Nonlesional"))
+
+cat("Unified metadata dimensions:", nrow(sample_info_all), "samples\n")
+cat("\nSamples per tissue:\n")
+print(table(sample_info_all$tissue_type))
+
+cat("\nSamples per week:\n")
+print(table(sample_info_all$week))
+
+cat("\nSamples per drug:\n")
+print(table(sample_info_all$drug))
+
+saveRDS(sample_info_all, file.path(output_dir, "sample_info_all_tissues.rds"))
+
+cat("\nSaved: sample_info_all_tissues.rds\n")
+cat("This file contains metadata for all", nrow(sample_info_all), "samples across all tissues\n")
+
+
+cat("\nExample usage:\n")
+cat("# Load unified metadata\n")
+cat("sample_info_all <- readRDS('sample_info_all_tissues.rds')\n\n")
+cat("# Subset to specific tissue\n")
+cat("blood_meta <- sample_info_all[sample_info_all$tissue_type == 'Blood', ]\n")
+cat("lesional_meta <- sample_info_all[sample_info_all$tissue_type == 'Lesional', ]\n\n")
+cat("# Cross-tissue queries\n")
+cat("patient_1001_all_tissues <- sample_info_all[sample_info_all$patient == '1001', ]\n")
+cat("week_12_all_tissues <- sample_info_all[sample_info_all$week == '12', ]\n")
+
+
+cat("Final datasets:\n")
+cat("Blood:        ", nrow(expr_blood), "samples x", ncol(expr_blood), "genes\n")
+cat("Lesional:     ", nrow(expr_lesional), "samples x", ncol(expr_lesional), "genes\n")
+cat("Nonlesional:  ", nrow(expr_nonlesional), "samples x", ncol(expr_nonlesional), "genes\n\n")
+
+cat("WGCNA-ready datasets:\n")
+cat("Blood:        ", ncol(expr_wgcna_blood), "genes\n")
+cat("Lesional:     ", ncol(expr_wgcna_lesional), "genes\n")
+cat("Nonlesional:  ", ncol(expr_wgcna_nonlesional), "genes\n\n")
+
+cat("Saved files:\n")
+cat("  expr_blood.rds, expr_wgcna_blood.rds, sample_info_blood.rds\n")
+cat("  expr_lesional.rds, expr_wgcna_lesional.rds, sample_info_lesional.rds\n")
+cat("  expr_nonlesional.rds, expr_wgcna_nonlesional.rds, sample_info_nonlesional.rds\n")
+cat("RADER ÄR SAMPLES OCH KOLUMNER ÄR GENER:\n")
+
+
+
+## UMAP VISUALISERING AV ALL TISSUE 
+
+run_umap_plot <- function(expr_matrix, metadata, title){
+  
+  # Run UMAP
+  umap_res <- umap(expr_matrix)
+  
+  umap_df <- data.frame(
+    UMAP1 = umap_res$layout[,1],
+    UMAP2 = umap_res$layout[,2],
+    week  = metadata$week
+  )
+  
+  # Professional plot
+  p <- ggplot(umap_df, aes(UMAP1, UMAP2, color = week)) +
+    geom_point(size = 2.5, alpha = 0.85) +
+    
+    scale_color_brewer(palette = "Dark2") +
+    
+    labs(
+      title = paste("UMAP of", title, "RNA-seq Samples"),
+      subtitle = "Samples colored by treatment week",
+      x = "UMAP 1",
+      y = "UMAP 2",
+      color = "Week"
+    ) +
+    
+    theme_bw(base_size = 13) +
+    
+    theme(
+      plot.title = element_text(face = "bold", size = 15),
+      plot.subtitle = element_text(size = 11),
+      legend.position = "top",
+      legend.title = element_text(face = "bold"),
+      panel.grid = element_blank(),
+      axis.text = element_text(color = "black")
+    )
+  
+  print(p)
+  return(p)
+}
+
+# Blood 
+p_blood <- run_umap_plot(expr_blood, sample_info_blood, "Blood")
+
+ggsave(
+  file.path(output_dir, "UMAP_blood_by_week.png"),
+  p_blood,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+# Lesional skin
+p_lesional <- run_umap_plot(expr_lesional, sample_info_lesional, "Lesional Skin")
+
+ggsave(
+  file.path(output_dir, "UMAP_lesional_by_week.png"),
+  p_lesional,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+# Nonlesional skin
+p_nonlesional <- run_umap_plot(expr_nonlesional, sample_info_nonlesional, "Nonlesional Skin")
+
+ggsave(
+  file.path(output_dir, "UMAP_nonlesional_by_week.png"),
+  p_nonlesional,
+  width = 7,
+  height = 5.5,
+  dpi = 300
+)
+
+cat("UMAP plots saved to:", output_dir, "\n")
+
