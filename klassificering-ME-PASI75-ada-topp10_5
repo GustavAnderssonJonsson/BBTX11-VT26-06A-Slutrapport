@@ -1,0 +1,184 @@
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(randomForest, caret, tidyverse, pheatmap, pROC)
+
+
+log_file <- "all_results_log.csv"
+if (!file.exists(log_file)) {
+  write.table(data.frame(Drug=character(), Tissue=character(), Target=character(), 
+                         Model=character(), AUC=numeric()), 
+              log_file, sep = ",", row.names = FALSE)
+}
+
+
+tissues <- c("lesional", "nonlesional", "blood")
+target_drug <- "Adalimumab" 
+target <- "PASI75"           
+threshold <- 0.75            
+n_iterations <- 100          
+
+for (tissue in tissues) {
+  if (!dir.exists(tissue)) next
+  
+  # 1. DATA - modul-egengener från WGCNA
+  samples_orig <- readRDS(file.path(tissue, "sample_info.rds"))
+  genes_orig   <- readRDS(file.path(tissue, "module_eigengenes.rds"))
+  
+  # 2. PASI-UTFALL
+  pasi_calc <- samples_orig %>%
+    filter(drug == target_drug) %>%
+    select(patient, week, PASI) %>%
+    spread(key = week, value = PASI, sep = "_")
+  
+  col_b <- "week_0"; col_f <- "week_12"
+  
+  if (!(col_b %in% colnames(pasi_calc) & col_f %in% colnames(pasi_calc))) {
+    message("Saknar tidsföljd för ", tissue, " - skippar.")
+    next
+  }
+  
+  pasi_calc <- pasi_calc %>%
+    mutate(improvement = (!!sym(col_b) - !!sym(col_f)) / !!sym(col_b),
+           Outcome_Var = ifelse(improvement >= threshold, "Yes", "No")) %>%
+    filter(!is.na(Outcome_Var))
+  
+  # Koppla till gen-ID
+  baseline_samples <- samples_orig %>% filter(week == 0, drug == target_drug)
+  final_patients <- intersect(pasi_calc$patient, baseline_samples$patient)
+  
+  if (length(final_patients) < 8) {
+    message("För få patienter i ", tissue, " (n=", length(final_patients), ") - skippar.")
+    next
+  }
+  
+  samples_final <- pasi_calc %>% filter(patient %in% final_patients) %>% arrange(patient)
+  gene_ids <- baseline_samples %>% filter(patient %in% final_patients) %>% arrange(patient) %>% pull(sample_id)
+  genes_final <- genes_orig[gene_ids, ]
+  
+  df_model <- data.frame(Outcome = as.factor(samples_final$Outcome_Var), genes_final)
+  
+  df_model <- data.frame(Outcome = as.factor(samples_final$Outcome_Var), genes_final)
+  
+  # Klassfördelning (respond/icke-respond) och baseline noggrannhet 
+  counts <- table(df_model$Outcome)
+  n_yes <- counts["Yes"]
+  n_no  <- counts["No"]
+  n_total <- sum(counts)
+  
+  baseline_acc <- max(counts) / n_total
+  
+  message("STATISTIK FÖR ", toupper(tissue), ":")
+  message("  Fördelning (Yes/No): ", n_yes, " / ", n_no)
+  message("  Baseline Accuracy: ", round(baseline_acc * 100, 1), "%")
+
+  
+  # Spara resultat 
+  base_dir <- paste0("CV100_", target_drug, "_", tissue, "_", target)
+  dir.create(base_dir, showWarnings = FALSE)
+  
+  message("\n--- STARTAR 100 SPLITS FÖR ", toupper(tissue), " ---")
+  
+  for (n_top in c(10, 5)) {
+    sub_dir <- file.path(base_dir, paste0("Top", n_top))
+    dir.create(sub_dir, showWarnings = FALSE)
+    
+    all_auc <- numeric(n_iterations)
+    cm_list <- list() 
+    
+    # Korsvalidering (100 SPLITS) med 80% träning/ 20% test 
+    for (i in 1:n_iterations) {
+      set.seed(i) 
+      
+      idx <- createDataPartition(df_model$Outcome, p = 0.8, list = FALSE)
+      train_data <- df_model[idx, ]
+      test_data  <- df_model[-idx, ]
+      
+      # Feature selection - för moduler
+      rf_temp <- randomForest(Outcome ~ ., data = train_data, importance = TRUE)
+      imp <- as.data.frame(importance(rf_temp))
+      top_feats <- rownames(imp)[order(imp$MeanDecreaseGini, decreasing = TRUE)][1:min(n_top, nrow(imp))]
+      
+      
+      rf_final <- randomForest(Outcome ~ ., data = train_data[, c("Outcome", top_feats)])
+      
+      # AUC
+      probs <- predict(rf_final, test_data[, top_feats], type = "prob")
+      roc_obj <- roc(test_data$Outcome, probs[, "Yes"], quiet = TRUE)
+      all_auc[i] <- as.numeric(auc(roc_obj))
+      
+      # Confusion Matrix
+      preds <- predict(rf_final, test_data)
+      cm_list[[i]] <- as.matrix(table(Prediction = preds, Reference = test_data$Outcome))
+    }
+    
+    
+    #  Mean AUC och Standardavvikelse 
+    mean_auc <- mean(all_auc)
+    sd_auc   <- sd(all_auc) 
+    avg_cm   <- Reduce('+', cm_list) / n_iterations
+    
+    
+    message("Klar med ", tissue, " Top ", n_top, ". Mean AUC: ", round(mean_auc, 3), " (+/- ", round(sd_auc, 3), ")")
+    
+  }
+  
+  # Resultaten från specifik körning
+  temp_results <- data.frame(
+    Drug = target_drug,
+    Tissue = tissue,
+    Target = target,
+    Model = "Full", 
+    AUC = all_auc
+  )
+  
+  
+  write.table(temp_results, log_file, sep = ",", append = TRUE, 
+              col.names = FALSE, row.names = FALSE)
+    
+    # Beräkna Accuracy från genomsnittlig CM
+    mean_acc <- (avg_cm[1,1] + avg_cm[2,2]) / sum(avg_cm)
+    
+    # Visualisering - grafer och plots 
+    
+    # 1. AUC fördelning (Histogram)
+    auc_df <- data.frame(AUC = all_auc)
+    p_auc <- ggplot(auc_df, aes(x = AUC)) +
+      geom_histogram(fill = ifelse(n_top == 10, "orange", "purple"), color = "white", bins = 12) +
+      geom_vline(xintercept = mean_auc, linetype = "dashed", size = 1) +
+      labs(title = paste(target_drug, target, "|", toupper(tissue)),
+           subtitle = paste("Mean AUC over 100 splits:", round(mean_auc, 3)),
+           x = "AUC Score", y = "Frequency") +
+      theme_minimal()
+    ggsave(file.path(sub_dir, "1_AUC_Distribution.png"), p_auc, width = 7, height = 5)
+    
+    # 2. Confusion matris
+    cm_plot <- as.data.frame(avg_cm) %>%
+      ggplot(aes(Prediction, Reference, fill = Freq)) +
+      geom_tile() + geom_text(aes(label = round(Freq, 1)), size = 8, fontface = "bold") +
+      scale_fill_gradient(low = "white", high = ifelse(n_top == 10, "e6550d#", "#6a51a3")) +
+      labs(title = paste("Average CM (100 splits) -", toupper(tissue), "- Top", n_top),
+           subtitle = paste0("Mean AUC: ", round(mean_auc, 3), 
+                             " | Mean Accuracy: ", round(mean_acc, 3), 
+                             " (", round(mean_acc * 100, 1), "%)")) +
+      theme_minimal()
+    ggsave(file.path(sub_dir, "2_Average_ConfusionMatrix.png"), cm_plot, width = 7, height = 6)
+    
+    # 3. Heatmap
+    rf_all <- randomForest(Outcome ~ ., data = df_model, importance = TRUE)
+    top_overall <- rownames(importance(rf_all))[order(importance(rf_all)[,4], decreasing = TRUE)][1:n_top]
+    
+    png(file.path(sub_dir, "3_Stability_Heatmap.png"), width=900, height=700)
+    pheatmap(t(as.matrix(df_model[, top_overall])), 
+             annotation_col = data.frame(Response = df_model$Outcome, row.names = rownames(df_model)),
+             main = paste(target_drug, target, "Top", n_top, "Modules in", toupper(tissue)),
+             color = colorRampPalette(c("blue", "white", "red"))(100),
+             display_numbers = TRUE)
+    dev.off()
+    
+    # 4. Spara resultat till plott
+    write.csv(auc_df, file.path(sub_dir, "AUC_all_100_splits.csv"))
+    
+    message("Klar med ", tissue, " Top ", n_top, ". Mean AUC: ", round(mean_auc, 3))
+  }
+
+
+message("\n*** ANALYSEN FÄRDIG ***")
